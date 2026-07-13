@@ -88,9 +88,10 @@
 
     <script>
         // --- ADD YOUR GITHUB PAGES ROMS HERE ---
+        // Converted your raw GitHub links to jsDelivr CDN links to bypass CORS blocking
         const PRELOADED_ROMS = [
-            'https://github.com/cldapps/emulator/raw/refs/heads/main/roms/Pokemon%20-%20FireRed%20Version%20(USA,%20Europe)%20(Rev%201).gba',
-            'https://github.com/cldapps/emulator/raw/refs/heads/main/roms/The%20Legend%20of%20Zelda%20-%20New%20Awakening%20(hack).gbc'
+            'https://cdn.jsdelivr.net/gh/cldapps/emulator@main/roms/Pokemon%20-%20FireRed%20Version%20(USA,%20Europe)%20(Rev%201).gba',
+            'https://cdn.jsdelivr.net/gh/cldapps/emulator@main/roms/The%20Legend%20of%20Zelda%20-%20New%20Awakening%20(hack).gbc'
         ];
 
         // --- STATE & DEFAULTS ---
@@ -240,7 +241,6 @@
                 list.appendChild(titlePre);
 
                 PRELOADED_ROMS.forEach(romPath => {
-                    // Decodes %20 into spaces for a clean UI
                     const rawFileName = romPath.split('/').pop();
                     const cleanFileName = decodeURIComponent(rawFileName);
                     
@@ -345,7 +345,7 @@
         // --- HYBRID GAME LAUNCHER ---
         async function launchGame(identifier, isPreloaded) {
             switchView('game');
-            appHeader.innerText = "Downloading Core..."; 
+            appHeader.innerText = "Loading..."; 
 
             try {
                 let romSource;
