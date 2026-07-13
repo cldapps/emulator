@@ -21,7 +21,7 @@
         }
         #app {
             display: flex; flex-direction: column; height: 100%;
-            max-width: 320px; /* Feature phone standard width */
+            max-width: 320px;
             margin: 0 auto; position: relative; background: #000;
         }
         .header {
@@ -36,7 +36,6 @@
             background: #222; border: 2px solid transparent; border-radius: 4px;
             margin-bottom: 6px; text-align: left; font-size: 14px; color: #fff;
         }
-        /* Crucial for Feature Phone D-Pad UX */
         .nav-item.focused {
             border-color: #00FF00; background: #333; outline: none;
         }
@@ -47,9 +46,6 @@
         }
         #game-view {
             display: none; flex: 1; justify-content: center; align-items: center; background: #000;
-        }
-        canvas {
-            max-width: 100%; max-height: 100%; object-fit: contain;
         }
         .hidden { display: none !important; }
         .danger { color: #ff5555; }
@@ -74,8 +70,8 @@
             <div class="nav-item danger" id="btn-clear-db">🗑️ Delete All Games</div>
         </div>
 
-        <div id="view-game" class="view hidden" style="flex:1; flex-direction: column;">
-            <div id="game-container" style="flex: 1; display: flex; justify-content: center; align-items: center;"></div>
+        <div id="view-game" class="view hidden" style="flex:1; display: flex; justify-content: center; align-items: center; background: #000;">
+            <canvas id="game-container" style="max-width: 100%; max-height: 100%; object-fit: contain;"></canvas>
         </div>
 
         <div class="soft-keys">
@@ -93,7 +89,6 @@
         let emulatorInstance = null;
         let roms = [];
 
-        // Default feature phone keymap. (Uses KeyPad numbers for standard A/B mapping)
         let keyMap = JSON.parse(localStorage.getItem('mosa_keymap')) || {
             a: '3', b: '1', x: '9', y: '7',
             start: '#', select: '*',
@@ -101,7 +96,6 @@
             quit: 'SoftRight' 
         };
 
-        // UI Elements
         const views = {
             home: document.getElementById('view-home'),
             settings: document.getElementById('view-settings'),
@@ -177,7 +171,6 @@
 
         // --- HARDWARE KEYBOARD HANDLER ---
         window.addEventListener('keydown', async (e) => {
-            // 1. If currently mapping a key in settings
             if (isMapping && currentView === 'settings') {
                 e.preventDefault();
                 keyMap[mappingKeyTarget] = e.key;
@@ -187,22 +180,19 @@
                 return;
             }
 
-            // 2. If game is running, listen for the Quit key
             if (currentView === 'game') {
                 if (e.key === keyMap.quit || e.key === 'Backspace' || e.key === 'SoftRight' || e.key === 'EndCall') {
                     e.preventDefault();
                     if (emulatorInstance) {
                         try { await emulatorInstance.exit(); } catch(err) {}
                         emulatorInstance = null;
-                        document.getElementById('game-container').innerHTML = ''; // clear canvas
                         switchView('home');
-                        window.location.reload(); // Hard reset to clear RAM
+                        window.location.reload(); 
                     }
                 }
                 return; 
             }
 
-            // 3. UI Navigation Logic (Home & Settings)
             const items = getNavItems();
             
             if (e.key === 'ArrowDown') {
@@ -272,7 +262,6 @@
             updateFocus();
         }
 
-        // --- EVENT LISTENERS ---
         document.getElementById('btn-upload').onclick = () => {
             document.getElementById('file-input').click();
         };
@@ -287,14 +276,12 @@
             switchView('home');
         };
 
-        // --- UPDATED FILE UPLOAD ---
         document.getElementById('file-input').addEventListener('change', async (e) => {
             const file = e.target.files[0];
             if (!file) return;
             
             appHeader.innerText = "Saving ROM...";
             try {
-                // Store as a Blob instead of an ArrayBuffer for better IndexedDB compatibility
                 const buffer = await file.arrayBuffer();
                 const blob = new Blob([buffer]);
                 const romId = Date.now();
@@ -314,7 +301,6 @@
             }
         });
 
-        // --- UPDATED NOSTALGIST LAUNCH ---
         async function launchGame(id) {
             const romData = await localforage.getItem('rom_' + id);
             if (!romData) return;
@@ -323,7 +309,6 @@
             appHeader.innerText = "Downloading Core..."; 
 
             try {
-                // Reconstruct a proper File object so RetroArch knows the file extension (.nes, .gba)
                 const fileData = romData.blob || romData.buffer; 
                 const romFile = new File([fileData], romData.name);
                 const coreName = getEmulatorCore(romData.name);
@@ -353,7 +338,6 @@
             }
         }
 
-        // Boot
         init();
     </script>
 </body>
