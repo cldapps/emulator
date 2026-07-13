@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Mosa Cloud Retro Phone</title>
+    
+    <script src="https://unpkg.com/nostalgist/dist/nostalgist.umd.js"></script>
+    <script src="https://unpkg.com/localforage/dist/localforage.min.js"></script>
+
+    <style>
+        :root {
+            --bg-color: #121212;
+            --hl-color: #0078D7;
+            --text-color: #FFFFFF;
+        }
+        body, html {
+            margin: 0; padding: 0; height: 100%; background: var(--bg-color);
+            color: var(--text-color); font-family: sans-serif; overflow: hidden;
+            user-select: none;
+        }
+        #app {
+            display: flex; flex-direction: column; height: 100%;
+            max-width: 320px; /* Feature phone standard width */
+            margin: 0 auto; position: relative; background: #000;
+        }
+        .header {
+            background: var(--hl-color); padding: 6px; text-align: center;
+            font-size: 14px; font-weight: bold; text-transform: uppercase;
+        }
+        .content {
+            flex: 1; overflow-y: auto; padding: 8px;
+        }
+        .nav-item {
+            display: block; width: 100%; padding: 10px; box-sizing: border-box;
+            background: #222; border: 2px solid transparent; border-radius: 4px;
+            margin-bottom: 6px; text-align: left; font-size: 14px; color: #fff;
+        }
+        /* Crucial for Feature Phone D-Pad UX */
+        .nav-item.focused {
+            border-color: #00FF00; background: #333; outline: none;
+        }
+        .soft-keys {
+            display: flex; justify-content: space-between; background: #111;
+            padding: 4px 8px; font-size: 12px; font-weight: bold; color: #aaa;
+            border-top: 1px solid #333;
+        }
+        #game-view {
+            display: none; flex: 1; justify-content: center; align-items: center; background: #000;
+        }
+        canvas {
+            max-width: 100%; max-height: 100%; object-fit: contain;
+        }
+        .hidden { display: none !important; }
+        .danger { color: #ff5555; }
+    </style>
+</head>
+<body>
+    <div id="app">
+        <div class="header" id="app-header">Retro Mosa</div>
+        
+        <div id="view-home" class="content view">
+            <div class="nav-item" id="btn-upload">📥 Upload New ROM</div>
+            <input type="file" id="file-input" class="hidden" accept=".nes,.gba,.gb,.gbc,.sfc,.smc,.md,.bin">
+            <div class="nav-item" id="btn-settings">⚙️ Settings (Map Keys)</div>
+            <div id="rom-list"></div>
+        </div>
+
+        <div id="view-settings" class="content view hidden">
+            <div style="font-size: 12px; margin-bottom: 10px; color: #ccc;">
+                Press ENTER on an action, then press the physical key you want to assign to it.
+            </div>
+            <div id="key-list"></div>
+            <div class="nav-item danger" id="btn-clear-db">🗑️ Delete All Games</div>
+        </div>
+
+        <div id="view-game" class="view hidden" style="flex:1; flex-direction: column;">
+            <div id="game-container" style="flex: 1; display: flex; justify-content: center; align-items: center;"></div>
+        </div>
+
+        <div class="soft-keys">
+            <span id="lsk-label">Select</span>
+            <span id="rsk-label">Exit</span>
+        </div>
+    </div>
+
+    <script>
+        // --- STATE & DEFAULTS ---
+        let currentView = 'home';
+        let focusIndex = 0;
+        let isMapping = false;
+        let mappingKeyTarget = null;
+        let emulatorInstance = null;
+        let roms = [];
+
+        // Default feature phone keymap. (Uses KeyPad numbers for standard A/B mapping)
+        let keyMap = JSON.parse(localStorage.getItem('mosa_keymap')) || {
+            a: '3', b: '1', x: '9', y: '7',
+            start: '#', select: '*',
+            up: 'ArrowUp', down: 'ArrowDown', left: 'ArrowLeft', right: 'ArrowRight',
+            quit: 'SoftRight' 
+        };
+
+        // UI Elements
+        const views = {
+            home: document.getElementById('view-home'),
+            settings: document.getElementById('view-settings'),
+            game: document.getElementById('view-game')
+        };
+        const lskLabel = document.getElementById('lsk-label');
+        const rskLabel = document.getElementById('rsk-label');
+        const appHeader = document.getElementById('app-header');
+
+        // --- CORE LOGIC ---
+        async function init() {
+            await loadRomsFromDB();
+            renderRomList();
+            renderSettingsList();
+            updateFocus();
+        }
+
+        async function loadRomsFromDB() {
+            roms = [];
+            await localforage.iterate((value, key) => {
+                if (key.startsWith('rom_')) roms.push(value);
+            });
+        }
+
+        function getEmulatorCore(filename) {
+            const ext = filename.split('.').pop().toLowerCase();
+            const cores = {
+                'nes': 'fceumm', 'gba': 'mgba', 'gb': 'gambatte', 'gbc': 'gambatte',
+                'sfc': 'snes9x', 'smc': 'snes9x', 'md': 'genesis_plus_gx', 'bin': 'genesis_plus_gx'
+            };
+            return cores[ext] || 'fceumm';
+        }
+
+        // --- UI NAVIGATION ---
+        function switchView(viewName) {
+            Object.values(views).forEach(v => v.classList.add('hidden'));
+            views[viewName].classList.remove('hidden');
+            currentView = viewName;
+            focusIndex = 0;
+
+            if (viewName === 'home') {
+                appHeader.innerText = "Retro Mosa";
+                lskLabel.innerText = "Select";
+                rskLabel.innerText = "Menu";
+                renderRomList();
+            } else if (viewName === 'settings') {
+                appHeader.innerText = "Key Mapper";
+                lskLabel.innerText = "Map";
+                rskLabel.innerText = "Back";
+            } else if (viewName === 'game') {
+                appHeader.innerText = "Playing";
+                lskLabel.innerText = "";
+                rskLabel.innerText = "Quit Game";
+            }
+            updateFocus();
+        }
+
+        function getNavItems() {
+            return views[currentView].querySelectorAll('.nav-item');
+        }
+
+        function updateFocus() {
+            const items = getNavItems();
+            items.forEach((el, i) => {
+                if (i === focusIndex) {
+                    el.classList.add('focused');
+                    el.scrollIntoView({ block: 'nearest' });
+                } else {
+                    el.classList.remove('focused');
+                }
+            });
+        }
+
+        // --- HARDWARE KEYBOARD HANDLER ---
+        window.addEventListener('keydown', async (e) => {
+            // 1. If currently mapping a key in settings
+            if (isMapping && currentView === 'settings') {
+                e.preventDefault();
+                keyMap[mappingKeyTarget] = e.key;
+                localStorage.setItem('mosa_keymap', JSON.stringify(keyMap));
+                isMapping = false;
+                renderSettingsList();
+                return;
+            }
+
+            // 2. If game is running, only listen for the specific Quit key (RSK or Backspace)
+            if (currentView === 'game') {
+                if (e.key === keyMap.quit || e.key === 'Backspace' || e.key === 'SoftRight' || e.key === 'EndCall') {
+                    e.preventDefault();
+                    if (emulatorInstance) {
+                        try { await emulatorInstance.exit(); } catch(err) {}
+                        emulatorInstance = null;
+                        document.getElementById('game-container').innerHTML = ''; // clear canvas
+                        switchView('home');
+                        window.location.reload(); // Hard reset to clear RAM on weak feature phones
+                    }
+                }
+                return; // Let Nostalgist handle standard game inputs
+            }
+
+            // 3. UI Navigation Logic (Home & Settings)
+            const items = getNavItems();
+            
+            if (e.key === 'ArrowDown') {
+                e.preventDefault();
+                focusIndex = (focusIndex + 1) % items.length;
+                updateFocus();
+            } 
+            else if (e.key === 'ArrowUp') {
+                e.preventDefault();
+                focusIndex = (focusIndex - 1 + items.length) % items.length;
+                updateFocus();
+            } 
+            else if (e.key === 'Enter' || e.key === 'SoftLeft') {
+                e.preventDefault();
+                if (items[focusIndex]) items[focusIndex].click();
+            } 
+            else if (e.key === 'SoftRight' || e.key === 'Backspace') {
+                e.preventDefault();
+                if (currentView === 'settings') switchView('home');
+            }
+        });
+
+        // --- RENDER & ACTIONS ---
+        function renderRomList() {
+            const list = document.getElementById('rom-list');
+            list.innerHTML = '';
+            roms.forEach(rom => {
+                const div = document.createElement('div');
+                div.className = 'nav-item';
+                div.innerHTML = `🎮 ${rom.name}`;
+                div.onclick = () => launchGame(rom.id);
+                list.appendChild(div);
+                
+                // Add an explicit delete button for each ROM to keep it scannable
+                const delDiv = document.createElement('div');
+                delDiv.className = 'nav-item danger';
+                delDiv.innerHTML = `❌ Delete ${rom.name.substring(0,10)}...`;
+                delDiv.onclick = async () => {
+                    await localforage.removeItem('rom_' + rom.id);
+                    await loadRomsFromDB();
+                    renderRomList();
+                    updateFocus();
+                };
+                list.appendChild(delDiv);
+            });
+            updateFocus();
+        }
+
+        function renderSettingsList() {
+            const list = document.getElementById('key-list');
+            list.innerHTML = '';
+            const mapOrder = ['a', 'b', 'x', 'y', 'start', 'select', 'up', 'down', 'left', 'right', 'quit'];
+            
+            mapOrder.forEach(key => {
+                const div = document.createElement('div');
+                div.className = 'nav-item';
+                div.innerHTML = isMapping && mappingKeyTarget === key 
+                    ? `Mapping [${key.toUpperCase()}]... Press a key!`
+                    : `Map ${key.toUpperCase()} (Current: <b>${keyMap[key]}</b>)`;
+                
+                div.onclick = () => {
+                    isMapping = true;
+                    mappingKeyTarget = key;
+                    renderSettingsList();
+                };
+                list.appendChild(div);
+            });
+            updateFocus();
+        }
+
+        // --- EVENT LISTENERS ---
+        document.getElementById('btn-upload').onclick = () => {
+            document.getElementById('file-input').click();
+        };
+
+        document.getElementById('btn-settings').onclick = () => {
+            switchView('settings');
+        };
+
+        document.getElementById('btn-clear-db').onclick = async () => {
+            await localforage.clear();
+            roms = [];
+            switchView('home');
+        };
+
+        document.getElementById('file-input').addEventListener('change', async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            const buffer = await file.arrayBuffer();
+            const romId = Date.now();
+            await localforage.setItem('rom_' + romId, { id: romId, name: file.name, buffer: buffer });
+            await loadRomsFromDB();
+            renderRomList();
+        });
+
+        // --- NOSTALGIST LAUNCH ---
+        async function launchGame(id) {
+            const romData = await localforage.getItem('rom_' + id);
+            if (!romData) return;
+            
+            switchView('game');
+            appHeader.innerText = "Loading...";
+
+            try {
+                emulatorInstance = await Nostalgist.launch({
+                    core: getEmulatorCore(romData.name),
+                    rom: romData.buffer,
+                    element: document.getElementById('game-container'),
+                    // Bind the custom keymap array mapped directly to RetroArch keys.
+                    retroarchConfig: {
+                        input_player1_a: keyMap.a.toLowerCase(),
+                        input_player1_b: keyMap.b.toLowerCase(),
+                        input_player1_x: keyMap.x.toLowerCase(),
+                        input_player1_y: keyMap.y.toLowerCase(),
+                        input_player1_start: keyMap.start.toLowerCase(),
+                        input_player1_select: keyMap.select.toLowerCase(),
+                        input_player1_up: keyMap.up.toLowerCase(),
+                        input_player1_down: keyMap.down.toLowerCase(),
+                        input_player1_left: keyMap.left.toLowerCase(),
+                        input_player1_right: keyMap.right.toLowerCase(),
+                    }
+                });
+                appHeader.innerText = "Playing (RSK to Quit)";
+            } catch (err) {
+                alert("Error loading core or ROM! " + err.message);
+                switchView('home');
+            }
+        }
+
+        // Boot
+        init();
+    </script>
+</body>
+</html>
