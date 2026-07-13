@@ -21,7 +21,7 @@
         }
         #app {
             display: flex; flex-direction: column; height: 100%;
-            max-width: 320px; /* Feature phone standard width  */
+            max-width: 320px; /* Feature phone standard width */
             margin: 0 auto; position: relative; background: #000;
         }
         .header {
@@ -80,7 +80,7 @@
 
         <div class="soft-keys">
             <span id="lsk-label">Select</span>
-            <span id="rsk-label">Exit</span>
+            <span id="rsk-label">Menu</span>
         </div>
     </div>
 
@@ -187,7 +187,7 @@
                 return;
             }
 
-            // 2. If game is running, only listen for the specific Quit key (RSK or Backspace)
+            // 2. If game is running, listen for the Quit key
             if (currentView === 'game') {
                 if (e.key === keyMap.quit || e.key === 'Backspace' || e.key === 'SoftRight' || e.key === 'EndCall') {
                     e.preventDefault();
@@ -196,10 +196,10 @@
                         emulatorInstance = null;
                         document.getElementById('game-container').innerHTML = ''; // clear canvas
                         switchView('home');
-                        window.location.reload(); // Hard reset to clear RAM on weak feature phones
+                        window.location.reload(); // Hard reset to clear RAM
                     }
                 }
-                return; // Let Nostalgist handle standard game inputs
+                return; 
             }
 
             // 3. UI Navigation Logic (Home & Settings)
@@ -236,7 +236,6 @@
                 div.onclick = () => launchGame(rom.id);
                 list.appendChild(div);
                 
-                // Add an explicit delete button for each ROM to keep it scannable
                 const delDiv = document.createElement('div');
                 delDiv.className = 'nav-item danger';
                 delDiv.innerHTML = `❌ Delete ${rom.name.substring(0,10)}...`;
@@ -288,30 +287,51 @@
             switchView('home');
         };
 
+        // --- UPDATED FILE UPLOAD ---
         document.getElementById('file-input').addEventListener('change', async (e) => {
             const file = e.target.files[0];
             if (!file) return;
-            const buffer = await file.arrayBuffer();
-            const romId = Date.now();
-            await localforage.setItem('rom_' + romId, { id: romId, name: file.name, buffer: buffer });
-            await loadRomsFromDB();
-            renderRomList();
+            
+            appHeader.innerText = "Saving ROM...";
+            try {
+                // Store as a Blob instead of an ArrayBuffer for better IndexedDB compatibility
+                const buffer = await file.arrayBuffer();
+                const blob = new Blob([buffer]);
+                const romId = Date.now();
+                
+                await localforage.setItem('rom_' + romId, { 
+                    id: romId, 
+                    name: file.name, 
+                    blob: blob 
+                });
+                
+                await loadRomsFromDB();
+                renderRomList();
+                appHeader.innerText = "Retro Mosa";
+            } catch (err) {
+                alert("Storage error: " + err.message);
+                appHeader.innerText = "Retro Mosa";
+            }
         });
 
-        // --- NOSTALGIST LAUNCH ---
+        // --- UPDATED NOSTALGIST LAUNCH ---
         async function launchGame(id) {
             const romData = await localforage.getItem('rom_' + id);
             if (!romData) return;
             
             switchView('game');
-            appHeader.innerText = "Loading...";
+            appHeader.innerText = "Downloading Core..."; 
 
             try {
+                // Reconstruct a proper File object so RetroArch knows the file extension (.nes, .gba)
+                const fileData = romData.blob || romData.buffer; 
+                const romFile = new File([fileData], romData.name);
+                const coreName = getEmulatorCore(romData.name);
+
                 emulatorInstance = await Nostalgist.launch({
-                    core: getEmulatorCore(romData.name),
-                    rom: romData.buffer,
+                    core: coreName,
+                    rom: romFile, 
                     element: document.getElementById('game-container'),
-                    // Bind the custom keymap array mapped directly to RetroArch keys.
                     retroarchConfig: {
                         input_player1_a: keyMap.a.toLowerCase(),
                         input_player1_b: keyMap.b.toLowerCase(),
@@ -327,7 +347,8 @@
                 });
                 appHeader.innerText = "Playing (RSK to Quit)";
             } catch (err) {
-                alert("Error loading core or ROM! " + err.message);
+                alert("Failed to load! " + err.message);
+                console.error("Nostalgist Error:", err);
                 switchView('home');
             }
         }
