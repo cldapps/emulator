@@ -5,26 +5,6 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Mosa Cloud Retro Phone</title>
 
-    <!--
-        FIX 1 — AUDIO
-          • Save realDest BEFORE overriding ctx.destination
-          • Best-mime detection via MediaRecorder.isTypeSupported()
-          • 200 ms chunks (was 500 ms) → much lower latency
-          • Recorder starts on gesture if autostart is blocked
-          • masterGain routes to BOTH capture node AND real speakers
-
-        FIX 2 — RESIZE
-          • #view-game is position:absolute so it truly overlays 240×320
-          • enforceGameSize() uses style.setProperty(...,'important')
-          • Backed by MutationObserver + ResizeObserver + 300 ms interval
-          • Enforcer starts AFTER Nostalgist finishes setup
-
-        FIX 3 — KEYMAP
-          • KEY_CODES table covers all RA keys (Arrow*, Enter, Shift, a/z/x/s)
-          • Fake events dispatch to document (where Emscripten listens)
-          • keyCode + which + code + view all populated correctly
-          • _isProxied flag prevents our own capture listener from looping
-    -->
     <script>
     (function () {
         const OrigAC = window.AudioContext || window.webkitAudioContext;
@@ -33,18 +13,12 @@
         function PatchedAudioContext(options) {
             const ctx = new OrigAC(options);
 
-            // ── Save real destination BEFORE we override it ──────────────
             const realDest = ctx.destination;
-
-            // ── Capture node (WebM stream) ────────────────────────────────
             const captureNode = ctx.createMediaStreamDestination();
 
-            // ── Virtual destination via GainNode ──────────────────────────
-            //    Any node connected to ctx.destination routes here,
-            //    then fans out to (a) WebM capture  (b) real speakers
             const masterGain = ctx.createGain();
             masterGain.connect(captureNode);
-            try { masterGain.connect(realDest); } catch (_) { /* cloud phones block */ }
+            try { masterGain.connect(realDest); } catch (_) {}
 
             Object.defineProperty(ctx, 'destination', {
                 get: () => masterGain,
@@ -52,63 +26,92 @@
                 enumerable: true
             });
 
-            // ── Resume on first gesture ───────────────────────────────────
-            const resumeCtx = () => { if (ctx.state === 'suspended') ctx.resume(); };
-
-            // ── Blob playback queue (Cloud Phone audio proxy) ─────────────
-            const audioEl = document.createElement('audio');
-            audioEl.style.display = 'none';
-            document.body.appendChild(audioEl);
-
+            // ── Double-Buffered Audio Elements ─────────────────────────────
+            const audio1 = document.createElement('audio');
+            const audio2 = document.createElement('audio');
+            // Cloud Phone attribute to prevent fullscreen hijacking
+            audio1.setAttribute('x-puffin-playsinline', 'true');
+            audio2.setAttribute('x-puffin-playsinline', 'true');
+            [audio1, audio2].forEach(a => { a.style.display = 'none'; document.body.appendChild(a); });
+            
+            let useAudio1 = true;
             const queue = [];
             let isPlaying = false;
 
             function playNextBlob() {
                 if (isPlaying || !queue.length) return;
                 isPlaying = true;
+                
                 const url = queue.shift();
-                audioEl.src = url;
-                audioEl.play()
-                    .then(() => {})
-                    .catch(() => { isPlaying = false; URL.revokeObjectURL(url); playNextBlob(); });
-                audioEl.onended = () => { URL.revokeObjectURL(url); isPlaying = false; playNextBlob(); };
-                audioEl.onerror = () => { isPlaying = false; URL.revokeObjectURL(url); playNextBlob(); };
+                const player = useAudio1 ? audio1 : audio2;
+                useAudio1 = !useAudio1; // Swap buffers
+
+                player.src = url;
+                player.play().catch(() => {
+                    isPlaying = false; 
+                    URL.revokeObjectURL(url); 
+                    playNextBlob(); 
+                });
+
+                player.onended = () => { 
+                    isPlaying = false; 
+                    URL.revokeObjectURL(url); 
+                    playNextBlob(); 
+                };
+                
+                player.onerror = () => { 
+                    isPlaying = false; 
+                    URL.revokeObjectURL(url); 
+                    playNextBlob(); 
+                };
             }
 
-            // ── Best supported mime type ──────────────────────────────────
-            const mimeType =
-                ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/ogg']
-                    .find(m => { try { return MediaRecorder.isTypeSupported(m); } catch (_) { return false; } })
-                || '';
+            const mimeType = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg']
+                .find(m => { try { return MediaRecorder.isTypeSupported(m); } catch (_) { return false; } }) || '';
 
-            let recorder;
-            try { recorder = new MediaRecorder(captureNode.stream, mimeType ? { mimeType } : {}); }
-            catch (_) { recorder = new MediaRecorder(captureNode.stream); }
+            let recorder = new MediaRecorder(captureNode.stream, mimeType ? { mimeType } : {});
 
             recorder.ondataavailable = (e) => {
                 if (e.data && e.data.size > 0) {
+                    // Keep emulator latency low by dropping stale audio if queue gets backed up
+                    if (queue.length > 2) URL.revokeObjectURL(queue.shift());
+                    
                     queue.push(URL.createObjectURL(e.data));
                     playNextBlob();
                 }
             };
 
-            // Start recorder; retry on first gesture if autostart is blocked
+            // ── Generate Discrete Standalone Files ─────────────────────────
             let recStarted = false;
-            const startRec = () => {
-                if (recStarted || recorder.state !== 'inactive') return;
-                try { recorder.start(200); recStarted = true; } catch (_) {}
+            
+            // When stopped, immediately start again to capture the next chunk properly
+            recorder.onstop = () => {
+                if (recStarted) recorder.start();
             };
-            startRec();
 
-            const onGesture = () => { resumeCtx(); startRec(); playNextBlob(); };
+            const startRec = () => {
+                if (recStarted) return;
+                recStarted = true;
+                recorder.start();
+                
+                // Force the recorder to finalize a complete file every 200ms
+                setInterval(() => {
+                    if (recorder.state === 'recording') recorder.stop();
+                }, 200);
+            };
+
+            const onGesture = () => { 
+                if (ctx.state === 'suspended') ctx.resume(); 
+                startRec(); 
+            };
+            
             ['touchstart', 'keydown', 'click', 'mousedown'].forEach(ev =>
                 window.addEventListener(ev, onGesture, { once: true })
             );
 
-            return ctx; // returning an object from `new` overrides `this`
+            return ctx; 
         }
 
-        // Preserve prototype chain so instanceof checks pass
         PatchedAudioContext.prototype = OrigAC.prototype;
         Object.setPrototypeOf(PatchedAudioContext, OrigAC);
 
@@ -220,7 +223,6 @@
         <div class="nav-item danger" id="btn-clear-db">🗑️ Delete Uploaded Games</div>
     </div>
 
-    <!-- Game overlay — always in DOM, toggled with .hidden -->
     <div id="view-game" class="view hidden">
         <canvas id="game-container"></canvas>
     </div>
@@ -248,7 +250,6 @@ const RA_KEYS = {
     left: 'ArrowLeft', right: 'ArrowRight'
 };
 
-// Correct keyCode values — special keys were previously returning 0
 const KEY_CODES = {
     z: 90, x: 88, a: 65, s: 83,
     Enter: 13, Shift: 16,
@@ -416,23 +417,25 @@ function updateFocus() {
 
 // ═══════════════════════════════════════════════════════════════
 // KEYMAP INPUT PROXY
-// Physical key → RetroArch standard key → dispatched to document
-// (Emscripten registers its listeners on document / window, NOT the canvas)
 // ═══════════════════════════════════════════════════════════════
 function dispatchRAKey(raKey, isDown) {
     const kc = getKeyCode(raKey);
     const ev = new KeyboardEvent(isDown ? 'keydown' : 'keyup', {
         key:        raKey,
         code:       getCodeStr(raKey),
-        keyCode:    kc,
-        which:      kc,
-        charCode:   0,
         bubbles:    true,
         cancelable: true,
+        composed:   true, // Ensures penetration into Emscripten canvas
         view:       window
     });
-    // Flag so our own capture listener ignores it
+
+    // Force legacy properties required by Emscripten C++ layer
+    Object.defineProperty(ev, 'keyCode', { value: kc });
+    Object.defineProperty(ev, 'which', { value: kc });
+    
+    // Flag so our own capture listener ignores the synthetic event loop
     Object.defineProperty(ev, '_isProxied', { value: true, enumerable: false });
+    
     document.dispatchEvent(ev);
 }
 
