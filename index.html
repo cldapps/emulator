@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Mosa Cloud Retro Phone</title>
     
-    <!-- CLOUD MOSA AUDIO PATCH: Must run before Nostalgist loads -->
+    <!-- CLOUD MOSA AUDIO PATCH: Converts AudioContext to WebM Blob Chunks -->
     <script>
         (function() {
             const OriginalAudioContext = window.AudioContext || window.webkitAudioContext;
@@ -14,32 +14,85 @@
             function PatchedAudioContext(options) {
                 const ctx = new OriginalAudioContext(options);
                 
-                // Intercept the WebAudio output and turn it into a MediaStream
+                // 1. Intercept Audio Output from the Emulator
                 const streamDest = ctx.createMediaStreamDestination();
-                
                 Object.defineProperty(ctx, 'destination', {
                     value: streamDest,
                     writable: false
                 });
 
-                // Pipe the stream into a standard HTML <audio> element.
-                // Cloud phone proxies (like CloudMosa) natively multiplex HTMLMediaElements 
-                // into their remote WebM streams, bypassing WebAudio hardware limitations.
+                // 2. Setup standard HTML Audio Element (Cloud phones proxy this natively)
                 const audioEl = document.createElement('audio');
                 audioEl.autoplay = true;
-                audioEl.srcObject = streamDest.stream;
                 audioEl.style.display = 'none';
                 document.body.appendChild(audioEl);
 
-                // Cloud renderers require interaction to unmute media elements
+                // 3. Setup Media Source Extensions (MSE) to handle WebM blobs
+                const mediaSource = new MediaSource();
+                audioEl.src = URL.createObjectURL(mediaSource);
+
+                mediaSource.addEventListener('sourceopen', () => {
+                    let mimeType = 'audio/webm; codecs="opus"';
+                    if (!MediaSource.isTypeSupported(mimeType)) mimeType = 'audio/webm'; // Fallback
+
+                    if (!MediaSource.isTypeSupported(mimeType)) {
+                        console.warn("MSE not supported, falling back to direct stream");
+                        audioEl.srcObject = streamDest.stream;
+                        return;
+                    }
+
+                    const sourceBuffer = mediaSource.addSourceBuffer(mimeType);
+                    sourceBuffer.mode = 'sequence';
+
+                    // 4. Record the raw stream and encode to WebM chunks on-the-fly
+                    const recorder = new MediaRecorder(streamDest.stream, { mimeType: mimeType });
+                    let queue = [];
+                    let isAppending = false;
+
+                    function processQueue() {
+                        if (queue.length > 0 && !isAppending && !sourceBuffer.updating) {
+                            isAppending = true;
+                            try {
+                                sourceBuffer.appendBuffer(queue.shift());
+                            } catch (e) {
+                                console.error("Buffer append error", e);
+                                isAppending = false;
+                            }
+                        }
+                    }
+
+                    sourceBuffer.addEventListener('updateend', () => {
+                        isAppending = false;
+                        processQueue();
+                        
+                        // Memory management: clean old buffer data every ~5 seconds
+                        if (!sourceBuffer.updating && audioEl.currentTime > 10) {
+                            try { sourceBuffer.remove(0, audioEl.currentTime - 4); } catch(e) {}
+                        }
+                    });
+
+                    recorder.ondataavailable = async (e) => {
+                        if (e.data && e.data.size > 0) {
+                            const buffer = await e.data.arrayBuffer();
+                            queue.push(buffer);
+                            processQueue();
+                        }
+                    };
+
+                    // Record and emit WebM chunks every 100ms for continuous playback
+                    recorder.start(100);
+                });
+
+                // Force play on first user interaction (bypasses cloud phone autoplay blocks)
                 const unlockAudio = () => {
-                    if (audioEl.paused) audioEl.play().catch(e => console.warn("Audio unlock pending:", e));
+                    if (audioEl.paused) audioEl.play().catch(() => {});
                 };
                 window.addEventListener('keydown', unlockAudio, {once: true});
                 window.addEventListener('touchstart', unlockAudio, {once: true});
 
                 return ctx;
             }
+            
             PatchedAudioContext.prototype = OriginalAudioContext.prototype;
             window.AudioContext = PatchedAudioContext;
             window.webkitAudioContext = PatchedAudioContext;
@@ -61,9 +114,10 @@
             user-select: none;
             display: flex; justify-content: center; align-items: center;
         }
+        /* Hardcode 240x320 Display Size */
         #app {
             display: flex; flex-direction: column; 
-            width: 240px; height: 320px; /* Fixed KaiOS / Retro screen size */
+            width: 240px; height: 320px; 
             position: relative; background: var(--bg-color); overflow: hidden;
         }
         .header {
@@ -119,6 +173,7 @@
             <div class="nav-item danger" id="btn-clear-db">🗑️ Delete Uploaded Games</div>
         </div>
 
+        <!-- The game canvas container -->
         <div id="view-game" class="view hidden">
             <canvas id="game-container" style="max-width: 100%; max-height: 100%; object-fit: contain;"></canvas>
         </div>
@@ -186,7 +241,6 @@
             Object.values(views).forEach(v => v.classList.add('hidden'));
             views[viewName].classList.remove('hidden');
             
-            // Show flex layout only for the game view (canvas centering)
             if (viewName === 'game') views[viewName].style.display = 'flex';
             else views[viewName].style.display = 'block';
             
@@ -207,7 +261,7 @@
                 lskLabel.innerText = "Map";
                 rskLabel.innerText = "Back";
             } else if (viewName === 'game') {
-                // Remove header and softkeys layout for maximum screen space during gameplay
+                // Completely remove header & menu while gaming
                 appHeader.style.display = 'none';
                 softKeys.style.display = 'none';
             }
@@ -247,7 +301,7 @@
                         try { await emulatorInstance.exit(); } catch(err) {}
                         emulatorInstance = null;
                         switchView('home');
-                        window.location.reload(); 
+                        window.location.reload(); // Refresh memory payload after exiting
                     }
                 }
                 return; 
