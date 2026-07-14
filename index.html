@@ -5,6 +5,47 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Mosa Cloud Retro Phone</title>
     
+    <!-- CLOUD MOSA AUDIO PATCH: Must run before Nostalgist loads -->
+    <script>
+        (function() {
+            const OriginalAudioContext = window.AudioContext || window.webkitAudioContext;
+            if (!OriginalAudioContext) return;
+
+            function PatchedAudioContext(options) {
+                const ctx = new OriginalAudioContext(options);
+                
+                // Intercept the WebAudio output and turn it into a MediaStream
+                const streamDest = ctx.createMediaStreamDestination();
+                
+                Object.defineProperty(ctx, 'destination', {
+                    value: streamDest,
+                    writable: false
+                });
+
+                // Pipe the stream into a standard HTML <audio> element.
+                // Cloud phone proxies (like CloudMosa) natively multiplex HTMLMediaElements 
+                // into their remote WebM streams, bypassing WebAudio hardware limitations.
+                const audioEl = document.createElement('audio');
+                audioEl.autoplay = true;
+                audioEl.srcObject = streamDest.stream;
+                audioEl.style.display = 'none';
+                document.body.appendChild(audioEl);
+
+                // Cloud renderers require interaction to unmute media elements
+                const unlockAudio = () => {
+                    if (audioEl.paused) audioEl.play().catch(e => console.warn("Audio unlock pending:", e));
+                };
+                window.addEventListener('keydown', unlockAudio, {once: true});
+                window.addEventListener('touchstart', unlockAudio, {once: true});
+
+                return ctx;
+            }
+            PatchedAudioContext.prototype = OriginalAudioContext.prototype;
+            window.AudioContext = PatchedAudioContext;
+            window.webkitAudioContext = PatchedAudioContext;
+        })();
+    </script>
+
     <script src="https://unpkg.com/nostalgist/dist/nostalgist.umd.js"></script>
     <script src="https://unpkg.com/localforage/dist/localforage.min.js"></script>
 
@@ -15,18 +56,20 @@
             --text-color: #FFFFFF;
         }
         body, html {
-            margin: 0; padding: 0; height: 100%; background: var(--bg-color);
+            margin: 0; padding: 0; height: 100%; background: #000;
             color: var(--text-color); font-family: sans-serif; overflow: hidden;
             user-select: none;
+            display: flex; justify-content: center; align-items: center;
         }
         #app {
-            display: flex; flex-direction: column; height: 100%;
-            max-width: 320px;
-            margin: 0 auto; position: relative; background: #000;
+            display: flex; flex-direction: column; 
+            width: 240px; height: 320px; /* Fixed KaiOS / Retro screen size */
+            position: relative; background: var(--bg-color); overflow: hidden;
         }
         .header {
             background: var(--hl-color); padding: 6px; text-align: center;
             font-size: 14px; font-weight: bold; text-transform: uppercase;
+            flex-shrink: 0;
         }
         .content {
             flex: 1; overflow-y: auto; padding: 8px;
@@ -47,10 +90,10 @@
         .soft-keys {
             display: flex; justify-content: space-between; background: #111;
             padding: 4px 8px; font-size: 12px; font-weight: bold; color: #aaa;
-            border-top: 1px solid #333;
+            border-top: 1px solid #333; flex-shrink: 0;
         }
-        #game-view {
-            display: none; flex: 1; justify-content: center; align-items: center; background: #000;
+        #view-game {
+            flex: 1; justify-content: center; align-items: center; background: #000;
         }
         .hidden { display: none !important; }
         .danger { color: #ff5555; }
@@ -76,25 +119,22 @@
             <div class="nav-item danger" id="btn-clear-db">🗑️ Delete Uploaded Games</div>
         </div>
 
-        <div id="view-game" class="view hidden" style="flex:1; display: flex; justify-content: center; align-items: center; background: #000;">
+        <div id="view-game" class="view hidden">
             <canvas id="game-container" style="max-width: 100%; max-height: 100%; object-fit: contain;"></canvas>
         </div>
 
-        <div class="soft-keys">
+        <div class="soft-keys" id="soft-keys">
             <span id="lsk-label">Select</span>
             <span id="rsk-label">Menu</span>
         </div>
     </div>
 
     <script>
-        // --- ADD YOUR GITHUB PAGES ROMS HERE ---
-        // Converted your raw GitHub links to jsDelivr CDN links to bypass CORS blocking
         const PRELOADED_ROMS = [
             'https://cdn.jsdelivr.net/gh/cldapps/emulator@main/roms/Pokemon%20-%20FireRed%20Version%20(USA,%20Europe)%20(Rev%201).gba',
             'https://cdn.jsdelivr.net/gh/cldapps/emulator@main/roms/The%20Legend%20of%20Zelda%20-%20New%20Awakening%20(hack).gbc'
         ];
 
-        // --- STATE &. DEFAULTS ---
         let currentView = 'home';
         let focusIndex = 0;
         let isMapping = false;
@@ -117,8 +157,8 @@
         const lskLabel = document.getElementById('lsk-label');
         const rskLabel = document.getElementById('rsk-label');
         const appHeader = document.getElementById('app-header');
+        const softKeys = document.getElementById('soft-keys');
 
-        // --- CORE LOGIC ---
         async function init() {
             await loadRomsFromDB();
             renderRomList();
@@ -142,26 +182,34 @@
             return cores[ext] || 'fceumm';
         }
 
-        // --- UI NAVIGATION ---
         function switchView(viewName) {
             Object.values(views).forEach(v => v.classList.add('hidden'));
             views[viewName].classList.remove('hidden');
+            
+            // Show flex layout only for the game view (canvas centering)
+            if (viewName === 'game') views[viewName].style.display = 'flex';
+            else views[viewName].style.display = 'block';
+            
             currentView = viewName;
             focusIndex = 0;
 
             if (viewName === 'home') {
+                appHeader.style.display = 'block';
+                softKeys.style.display = 'flex';
                 appHeader.innerText = "Retro Mosa";
                 lskLabel.innerText = "Select";
                 rskLabel.innerText = "Menu";
                 renderRomList();
             } else if (viewName === 'settings') {
+                appHeader.style.display = 'block';
+                softKeys.style.display = 'flex';
                 appHeader.innerText = "Key Mapper";
                 lskLabel.innerText = "Map";
                 rskLabel.innerText = "Back";
             } else if (viewName === 'game') {
-                appHeader.innerText = "Playing";
-                lskLabel.innerText = "";
-                rskLabel.innerText = "Quit Game";
+                // Remove header and softkeys layout for maximum screen space during gameplay
+                appHeader.style.display = 'none';
+                softKeys.style.display = 'none';
             }
             updateFocus();
         }
@@ -182,7 +230,6 @@
             });
         }
 
-        // --- HARDWARE KEYBOARD HANDLER ---
         window.addEventListener('keydown', async (e) => {
             if (isMapping && currentView === 'settings') {
                 e.preventDefault();
@@ -228,12 +275,10 @@
             }
         });
 
-        // --- RENDER & ACTIONS ---
         function renderRomList() {
             const list = document.getElementById('rom-list');
             list.innerHTML = '';
 
-            // 1. Render Preloaded GitHub Games
             if (PRELOADED_ROMS.length > 0) {
                 const titlePre = document.createElement('div');
                 titlePre.className = 'section-title';
@@ -252,7 +297,6 @@
                 });
             }
 
-            // 2. Render User Uploaded Games
             if (userRoms.length > 0) {
                 const titleUser = document.createElement('div');
                 titleUser.className = 'section-title';
@@ -342,10 +386,8 @@
             }
         });
 
-        // --- HYBRID GAME LAUNCHER ---
         async function launchGame(identifier, isPreloaded) {
             switchView('game');
-            appHeader.innerText = "Loading..."; 
 
             try {
                 let romSource;
@@ -381,7 +423,6 @@
                         input_player1_right: keyMap.right.toLowerCase(),
                     }
                 });
-                appHeader.innerText = "Playing (RSK to Quit)";
             } catch (err) {
                 alert("Failed to load! " + err.message);
                 console.error("Nostalgist Error:", err);
