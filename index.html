@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Mosa Cloud Retro Phone</title>
     
-    <!-- CLOUD MOSA AUDIO PATCH: Converts AudioContext to WebM Blob Chunks -->
+    <!-- CLOUD MOSA AUDIO PATCH: Chunk WebAudio to WebM Blobs -->
     <script>
         (function() {
             const OriginalAudioContext = window.AudioContext || window.webkitAudioContext;
@@ -14,85 +14,57 @@
             function PatchedAudioContext(options) {
                 const ctx = new OriginalAudioContext(options);
                 
-                // 1. Intercept Audio Output from the Emulator
+                // 1. Capture emulator audio output
                 const streamDest = ctx.createMediaStreamDestination();
-                Object.defineProperty(ctx, 'destination', {
-                    value: streamDest,
-                    writable: false
-                });
+                Object.defineProperty(ctx, 'destination', { value: streamDest, writable: false });
 
-                // 2. Setup standard HTML Audio Element (Cloud phones proxy this natively)
+                // 2. Setup a standard HTML Audio element (natively proxies on Cloud Phones)
                 const audioEl = document.createElement('audio');
-                audioEl.autoplay = true;
                 audioEl.style.display = 'none';
                 document.body.appendChild(audioEl);
 
-                // 3. Setup Media Source Extensions (MSE) to handle WebM blobs
-                const mediaSource = new MediaSource();
-                audioEl.src = URL.createObjectURL(mediaSource);
+                // 3. Record the stream to WebM Blobs
+                const mimeType = 'audio/webm';
+                const recorder = new MediaRecorder(streamDest.stream, { mimeType });
+                
+                // 4. Sequential Blob Playback Queue
+                const queue = [];
+                let isPlaying = false;
 
-                mediaSource.addEventListener('sourceopen', () => {
-                    let mimeType = 'audio/webm; codecs="opus"';
-                    if (!MediaSource.isTypeSupported(mimeType)) mimeType = 'audio/webm'; // Fallback
-
-                    if (!MediaSource.isTypeSupported(mimeType)) {
-                        console.warn("MSE not supported, falling back to direct stream");
-                        audioEl.srcObject = streamDest.stream;
-                        return;
-                    }
-
-                    const sourceBuffer = mediaSource.addSourceBuffer(mimeType);
-                    sourceBuffer.mode = 'sequence';
-
-                    // 4. Record the raw stream and encode to WebM chunks on-the-fly
-                    const recorder = new MediaRecorder(streamDest.stream, { mimeType: mimeType });
-                    let queue = [];
-                    let isAppending = false;
-
-                    function processQueue() {
-                        if (queue.length > 0 && !isAppending && !sourceBuffer.updating) {
-                            isAppending = true;
-                            try {
-                                sourceBuffer.appendBuffer(queue.shift());
-                            } catch (e) {
-                                console.error("Buffer append error", e);
-                                isAppending = false;
-                            }
-                        }
-                    }
-
-                    sourceBuffer.addEventListener('updateend', () => {
-                        isAppending = false;
-                        processQueue();
-                        
-                        // Memory management: clean old buffer data every ~5 seconds
-                        if (!sourceBuffer.updating && audioEl.currentTime > 10) {
-                            try { sourceBuffer.remove(0, audioEl.currentTime - 4); } catch(e) {}
-                        }
-                    });
-
-                    recorder.ondataavailable = async (e) => {
-                        if (e.data && e.data.size > 0) {
-                            const buffer = await e.data.arrayBuffer();
-                            queue.push(buffer);
-                            processQueue();
-                        }
+                function playNextBlob() {
+                    if (isPlaying || queue.length === 0) return;
+                    isPlaying = true;
+                    const blobUrl = queue.shift();
+                    
+                    audioEl.src = blobUrl;
+                    audioEl.play().catch(() => { isPlaying = false; });
+                    
+                    audioEl.onended = () => {
+                        URL.revokeObjectURL(blobUrl); // Prevent memory leaks
+                        isPlaying = false;
+                        playNextBlob();
                     };
+                }
 
-                    // Record and emit WebM chunks every 100ms for continuous playback
-                    recorder.start(100);
-                });
+                recorder.ondataavailable = (e) => {
+                    if (e.data && e.data.size > 0) {
+                        queue.push(URL.createObjectURL(e.data));
+                        playNextBlob();
+                    }
+                };
 
-                // Force play on first user interaction (bypasses cloud phone autoplay blocks)
+                // Emit audio blobs every 500ms
+                recorder.start(500);
+
+                // Force unlock audio on first interaction
                 const unlockAudio = () => {
-                    if (audioEl.paused) audioEl.play().catch(() => {});
+                    if (audioEl.paused) audioEl.play().catch(()=>{});
                 };
                 window.addEventListener('keydown', unlockAudio, {once: true});
                 window.addEventListener('touchstart', unlockAudio, {once: true});
 
                 return ctx;
             }
-            
             PatchedAudioContext.prototype = OriginalAudioContext.prototype;
             window.AudioContext = PatchedAudioContext;
             window.webkitAudioContext = PatchedAudioContext;
@@ -114,7 +86,8 @@
             user-select: none;
             display: flex; justify-content: center; align-items: center;
         }
-        /* Hardcode 240x320 Display Size */
+        
+        /* HARDCODED RESOLUTION: Force 240x320 container */
         #app {
             display: flex; flex-direction: column; 
             width: 240px; height: 320px; 
@@ -146,9 +119,22 @@
             padding: 4px 8px; font-size: 12px; font-weight: bold; color: #aaa;
             border-top: 1px solid #333; flex-shrink: 0;
         }
+        
+        /* FULLSCREEN CANVAS STRETCH */
         #view-game {
-            flex: 1; justify-content: center; align-items: center; background: #000;
+            width: 240px; height: 320px; margin: 0; padding: 0;
+            background: #000;
         }
+        #game-container {
+            width: 240px !important;
+            height: 320px !important;
+            max-width: 240px !important;
+            max-height: 320px !important;
+            object-fit: fill !important; /* Forces stretch ignoring original aspect ratio */
+            image-rendering: pixelated;
+            display: block;
+        }
+        
         .hidden { display: none !important; }
         .danger { color: #ff5555; }
     </style>
@@ -173,9 +159,9 @@
             <div class="nav-item danger" id="btn-clear-db">🗑️ Delete Uploaded Games</div>
         </div>
 
-        <!-- The game canvas container -->
+        <!-- Game viewport directly houses the canvas -->
         <div id="view-game" class="view hidden">
-            <canvas id="game-container" style="max-width: 100%; max-height: 100%; object-fit: contain;"></canvas>
+            <canvas id="game-container"></canvas>
         </div>
 
         <div class="soft-keys" id="soft-keys">
@@ -189,6 +175,13 @@
             'https://cdn.jsdelivr.net/gh/cldapps/emulator@main/roms/Pokemon%20-%20FireRed%20Version%20(USA,%20Europe)%20(Rev%201).gba',
             'https://cdn.jsdelivr.net/gh/cldapps/emulator@main/roms/The%20Legend%20of%20Zelda%20-%20New%20Awakening%20(hack).gbc'
         ];
+
+        // Standard PC Keys expected natively by Emscripten/RetroArch
+        const RA_KEYS = {
+            a: 'z', b: 'x', x: 's', y: 'a',
+            start: 'Enter', select: 'Shift',
+            up: 'ArrowUp', down: 'ArrowDown', left: 'ArrowLeft', right: 'ArrowRight'
+        };
 
         let currentView = 'home';
         let focusIndex = 0;
@@ -240,9 +233,7 @@
         function switchView(viewName) {
             Object.values(views).forEach(v => v.classList.add('hidden'));
             views[viewName].classList.remove('hidden');
-            
-            if (viewName === 'game') views[viewName].style.display = 'flex';
-            else views[viewName].style.display = 'block';
+            views[viewName].style.display = 'block';
             
             currentView = viewName;
             focusIndex = 0;
@@ -261,7 +252,7 @@
                 lskLabel.innerText = "Map";
                 rskLabel.innerText = "Back";
             } else if (viewName === 'game') {
-                // Completely remove header & menu while gaming
+                // Completely hide header and soft-keys for full 240x320 stretch
                 appHeader.style.display = 'none';
                 softKeys.style.display = 'none';
             }
@@ -284,7 +275,45 @@
             });
         }
 
-        window.addEventListener('keydown', async (e) => {
+        // --- KEYMAP PROXY HANDLER ---
+        // Catches physical cloud-phone keys and translates them to standard PC keyboard
+        // events so Emscripten/RetroArch natively detects them.
+        function handleEmulatorInput(e, isDown) {
+            if (currentView !== 'game' || e.isProxied) return;
+
+            // Handle quitting the emulator safely
+            if (isDown && (e.key === keyMap.quit || e.key === 'Backspace' || e.key === 'SoftRight')) {
+                e.preventDefault();
+                if (emulatorInstance) {
+                    emulatorInstance.exit().catch(()=>{});
+                    window.location.reload(); 
+                }
+                return;
+            }
+
+            for (const [action, boundKey] of Object.entries(keyMap)) {
+                if (e.key === boundKey && RA_KEYS[action]) {
+                    e.preventDefault();
+                    e.stopImmediatePropagation(); // Block original physical key
+                    
+                    const stdKey = RA_KEYS[action];
+                    const fakeEvent = new KeyboardEvent(isDown ? 'keydown' : 'keyup', {
+                        key: stdKey,
+                        code: stdKey.length > 1 ? stdKey : 'Key' + stdKey.toUpperCase(),
+                        keyCode: stdKey.length === 1 ? stdKey.toUpperCase().charCodeAt(0) : 0,
+                        bubbles: true, cancelable: true
+                    });
+                    fakeEvent.isProxied = true;
+                    
+                    const canvas = document.getElementById('game-container');
+                    if (canvas) canvas.dispatchEvent(fakeEvent);
+                    return;
+                }
+            }
+        }
+
+        window.addEventListener('keydown', (e) => {
+            // Mapping Logic
             if (isMapping && currentView === 'settings') {
                 e.preventDefault();
                 keyMap[mappingKeyTarget] = e.key;
@@ -294,41 +323,36 @@
                 return;
             }
 
+            // Gameplay input
             if (currentView === 'game') {
-                if (e.key === keyMap.quit || e.key === 'Backspace' || e.key === 'SoftRight' || e.key === 'EndCall') {
-                    e.preventDefault();
-                    if (emulatorInstance) {
-                        try { await emulatorInstance.exit(); } catch(err) {}
-                        emulatorInstance = null;
-                        switchView('home');
-                        window.location.reload(); // Refresh memory payload after exiting
-                    }
-                }
-                return; 
+                handleEmulatorInput(e, true);
+                return;
             }
 
+            // UI Navigation
             const items = getNavItems();
-            
             if (e.key === 'ArrowDown') {
                 e.preventDefault();
                 focusIndex = (focusIndex + 1) % items.length;
                 updateFocus();
-            } 
-            else if (e.key === 'ArrowUp') {
+            } else if (e.key === 'ArrowUp') {
                 e.preventDefault();
                 focusIndex = (focusIndex - 1 + items.length) % items.length;
                 updateFocus();
-            } 
-            else if (e.key === 'Enter' || e.key === 'SoftLeft') {
+            } else if (e.key === 'Enter' || e.key === 'SoftLeft') {
                 e.preventDefault();
                 if (items[focusIndex]) items[focusIndex].click();
-            } 
-            else if (e.key === 'SoftRight' || e.key === 'Backspace') {
+            } else if (e.key === 'SoftRight' || e.key === 'Backspace') {
                 e.preventDefault();
                 if (currentView === 'settings') switchView('home');
             }
-        });
+        }, true); // Use capture phase to intercept before Emscripten
 
+        window.addEventListener('keyup', (e) => {
+            if (currentView === 'game') handleEmulatorInput(e, false);
+        }, true);
+
+        // --- UI RENDERING ---
         function renderRomList() {
             const list = document.getElementById('rom-list');
             list.innerHTML = '';
@@ -401,14 +425,8 @@
             updateFocus();
         }
 
-        document.getElementById('btn-upload').onclick = () => {
-            document.getElementById('file-input').click();
-        };
-
-        document.getElementById('btn-settings').onclick = () => {
-            switchView('settings');
-        };
-
+        document.getElementById('btn-upload').onclick = () => { document.getElementById('file-input').click(); };
+        document.getElementById('btn-settings').onclick = () => { switchView('settings'); };
         document.getElementById('btn-clear-db').onclick = async () => {
             await localforage.clear();
             userRoms = [];
@@ -425,12 +443,7 @@
                 const blob = new Blob([buffer]);
                 const romId = Date.now();
                 
-                await localforage.setItem('rom_' + romId, { 
-                    id: romId, 
-                    name: file.name, 
-                    blob: blob 
-                });
-                
+                await localforage.setItem('rom_' + romId, { id: romId, name: file.name, blob: blob });
                 await loadRomsFromDB();
                 renderRomList();
                 appHeader.innerText = "Retro Mosa";
@@ -440,6 +453,7 @@
             }
         });
 
+        // --- LAUNCH GAME ---
         async function launchGame(identifier, isPreloaded) {
             switchView('game');
 
@@ -460,26 +474,15 @@
 
                 const coreName = getEmulatorCore(fileName);
 
+                // Note: We no longer pass custom keys into retroarchConfig. 
+                // The Proxy Handler maps your keys directly into standard inputs!
                 emulatorInstance = await Nostalgist.launch({
                     core: coreName,
                     rom: romSource, 
-                    element: document.getElementById('game-container'),
-                    retroarchConfig: {
-                        input_player1_a: keyMap.a.toLowerCase(),
-                        input_player1_b: keyMap.b.toLowerCase(),
-                        input_player1_x: keyMap.x.toLowerCase(),
-                        input_player1_y: keyMap.y.toLowerCase(),
-                        input_player1_start: keyMap.start.toLowerCase(),
-                        input_player1_select: keyMap.select.toLowerCase(),
-                        input_player1_up: keyMap.up.toLowerCase(),
-                        input_player1_down: keyMap.down.toLowerCase(),
-                        input_player1_left: keyMap.left.toLowerCase(),
-                        input_player1_right: keyMap.right.toLowerCase(),
-                    }
+                    element: document.getElementById('game-container')
                 });
             } catch (err) {
                 alert("Failed to load! " + err.message);
-                console.error("Nostalgist Error:", err);
                 switchView('home');
             }
         }
