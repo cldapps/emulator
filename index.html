@@ -4,490 +4,626 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Mosa Cloud Retro Phone</title>
-    
-    <!-- CLOUD MOSA AUDIO PATCH: Chunk WebAudio to WebM Blobs -->
+
+    <!--
+        FIX 1 — AUDIO
+          • Save realDest BEFORE overriding ctx.destination
+          • Best-mime detection via MediaRecorder.isTypeSupported()
+          • 200 ms chunks (was 500 ms) → much lower latency
+          • Recorder starts on gesture if autostart is blocked
+          • masterGain routes to BOTH capture node AND real speakers
+
+        FIX 2 — RESIZE
+          • #view-game is position:absolute so it truly overlays 240×320
+          • enforceGameSize() uses style.setProperty(...,'important')
+          • Backed by MutationObserver + ResizeObserver + 300 ms interval
+          • Enforcer starts AFTER Nostalgist finishes setup
+
+        FIX 3 — KEYMAP
+          • KEY_CODES table covers all RA keys (Arrow*, Enter, Shift, a/z/x/s)
+          • Fake events dispatch to document (where Emscripten listens)
+          • keyCode + which + code + view all populated correctly
+          • _isProxied flag prevents our own capture listener from looping
+    -->
     <script>
-        (function() {
-            const OriginalAudioContext = window.AudioContext || window.webkitAudioContext;
-            if (!OriginalAudioContext) return;
+    (function () {
+        const OrigAC = window.AudioContext || window.webkitAudioContext;
+        if (!OrigAC) return;
 
-            function PatchedAudioContext(options) {
-                const ctx = new OriginalAudioContext(options);
-                
-                // 1. Capture emulator audio output
-                const streamDest = ctx.createMediaStreamDestination();
-                Object.defineProperty(ctx, 'destination', { value: streamDest, writable: false });
+        function PatchedAudioContext(options) {
+            const ctx = new OrigAC(options);
 
-                // 2. Setup a standard HTML Audio element (natively proxies on Cloud Phones)
-                const audioEl = document.createElement('audio');
-                audioEl.style.display = 'none';
-                document.body.appendChild(audioEl);
+            // ── Save real destination BEFORE we override it ──────────────
+            const realDest = ctx.destination;
 
-                // 3. Record the stream to WebM Blobs
-                const mimeType = 'audio/webm';
-                const recorder = new MediaRecorder(streamDest.stream, { mimeType });
-                
-                // 4. Sequential Blob Playback Queue
-                const queue = [];
-                let isPlaying = false;
+            // ── Capture node (WebM stream) ────────────────────────────────
+            const captureNode = ctx.createMediaStreamDestination();
 
-                function playNextBlob() {
-                    if (isPlaying || queue.length === 0) return;
-                    isPlaying = true;
-                    const blobUrl = queue.shift();
-                    
-                    audioEl.src = blobUrl;
-                    audioEl.play().catch(() => { isPlaying = false; });
-                    
-                    audioEl.onended = () => {
-                        URL.revokeObjectURL(blobUrl); // Prevent memory leaks
-                        isPlaying = false;
-                        playNextBlob();
-                    };
-                }
+            // ── Virtual destination via GainNode ──────────────────────────
+            //    Any node connected to ctx.destination routes here,
+            //    then fans out to (a) WebM capture  (b) real speakers
+            const masterGain = ctx.createGain();
+            masterGain.connect(captureNode);
+            try { masterGain.connect(realDest); } catch (_) { /* cloud phones block */ }
 
-                recorder.ondataavailable = (e) => {
-                    if (e.data && e.data.size > 0) {
-                        queue.push(URL.createObjectURL(e.data));
-                        playNextBlob();
-                    }
-                };
+            Object.defineProperty(ctx, 'destination', {
+                get: () => masterGain,
+                configurable: true,
+                enumerable: true
+            });
 
-                // Emit audio blobs every 500ms
-                recorder.start(500);
+            // ── Resume on first gesture ───────────────────────────────────
+            const resumeCtx = () => { if (ctx.state === 'suspended') ctx.resume(); };
 
-                // Force unlock audio on first interaction
-                const unlockAudio = () => {
-                    if (audioEl.paused) audioEl.play().catch(()=>{});
-                };
-                window.addEventListener('keydown', unlockAudio, {once: true});
-                window.addEventListener('touchstart', unlockAudio, {once: true});
+            // ── Blob playback queue (Cloud Phone audio proxy) ─────────────
+            const audioEl = document.createElement('audio');
+            audioEl.style.display = 'none';
+            document.body.appendChild(audioEl);
 
-                return ctx;
+            const queue = [];
+            let isPlaying = false;
+
+            function playNextBlob() {
+                if (isPlaying || !queue.length) return;
+                isPlaying = true;
+                const url = queue.shift();
+                audioEl.src = url;
+                audioEl.play()
+                    .then(() => {})
+                    .catch(() => { isPlaying = false; URL.revokeObjectURL(url); playNextBlob(); });
+                audioEl.onended = () => { URL.revokeObjectURL(url); isPlaying = false; playNextBlob(); };
+                audioEl.onerror = () => { isPlaying = false; URL.revokeObjectURL(url); playNextBlob(); };
             }
-            PatchedAudioContext.prototype = OriginalAudioContext.prototype;
-            window.AudioContext = PatchedAudioContext;
-            window.webkitAudioContext = PatchedAudioContext;
-        })();
+
+            // ── Best supported mime type ──────────────────────────────────
+            const mimeType =
+                ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/ogg']
+                    .find(m => { try { return MediaRecorder.isTypeSupported(m); } catch (_) { return false; } })
+                || '';
+
+            let recorder;
+            try { recorder = new MediaRecorder(captureNode.stream, mimeType ? { mimeType } : {}); }
+            catch (_) { recorder = new MediaRecorder(captureNode.stream); }
+
+            recorder.ondataavailable = (e) => {
+                if (e.data && e.data.size > 0) {
+                    queue.push(URL.createObjectURL(e.data));
+                    playNextBlob();
+                }
+            };
+
+            // Start recorder; retry on first gesture if autostart is blocked
+            let recStarted = false;
+            const startRec = () => {
+                if (recStarted || recorder.state !== 'inactive') return;
+                try { recorder.start(200); recStarted = true; } catch (_) {}
+            };
+            startRec();
+
+            const onGesture = () => { resumeCtx(); startRec(); playNextBlob(); };
+            ['touchstart', 'keydown', 'click', 'mousedown'].forEach(ev =>
+                window.addEventListener(ev, onGesture, { once: true })
+            );
+
+            return ctx; // returning an object from `new` overrides `this`
+        }
+
+        // Preserve prototype chain so instanceof checks pass
+        PatchedAudioContext.prototype = OrigAC.prototype;
+        Object.setPrototypeOf(PatchedAudioContext, OrigAC);
+
+        window.AudioContext = PatchedAudioContext;
+        window.webkitAudioContext = PatchedAudioContext;
+    })();
     </script>
 
     <script src="https://unpkg.com/nostalgist/dist/nostalgist.umd.js"></script>
     <script src="https://unpkg.com/localforage/dist/localforage.min.js"></script>
 
     <style>
-        :root {
-            --bg-color: #121212;
-            --hl-color: #0078D7;
-            --text-color: #FFFFFF;
-        }
+        :root { --bg: #121212; --hl: #0078D7; --fg: #fff; }
+
+        *, *::before, *::after { box-sizing: border-box; }
+
         body, html {
-            margin: 0; padding: 0; height: 100%; background: #000;
-            color: var(--text-color); font-family: sans-serif; overflow: hidden;
+            margin: 0; padding: 0; height: 100%;
+            background: #000; color: var(--fg);
+            font-family: sans-serif; overflow: hidden;
             user-select: none;
             display: flex; justify-content: center; align-items: center;
         }
-        
-        /* HARDCODED RESOLUTION: Force 240x320 container */
+
+        /* Fixed 240×320 phone shell */
         #app {
-            display: flex; flex-direction: column; 
-            width: 240px; height: 320px; 
-            position: relative; background: var(--bg-color); overflow: hidden;
+            position: relative;        /* anchor for absolute #view-game */
+            display: flex; flex-direction: column;
+            width: 240px; height: 320px;
+            background: var(--bg); overflow: hidden;
         }
+
         .header {
-            background: var(--hl-color); padding: 6px; text-align: center;
-            font-size: 14px; font-weight: bold; text-transform: uppercase;
             flex-shrink: 0;
+            background: var(--hl); padding: 6px;
+            text-align: center; font-size: 14px;
+            font-weight: bold; text-transform: uppercase;
         }
-        .content {
-            flex: 1; overflow-y: auto; padding: 8px;
-        }
+
+        .content { flex: 1; overflow-y: auto; padding: 8px; }
+
         .section-title {
             font-size: 11px; color: #888; text-transform: uppercase;
-            margin: 10px 0 4px 0; font-weight: bold; text-align: center;
+            margin: 10px 0 4px; font-weight: bold; text-align: center;
             border-bottom: 1px solid #333; padding-bottom: 4px;
         }
+
         .nav-item {
-            display: block; width: 100%; padding: 10px; box-sizing: border-box;
-            background: #222; border: 2px solid transparent; border-radius: 4px;
-            margin-bottom: 6px; text-align: left; font-size: 14px; color: #fff;
+            display: block; width: 100%; padding: 10px;
+            background: #222; border: 2px solid transparent;
+            border-radius: 4px; margin-bottom: 6px;
+            text-align: left; font-size: 14px; color: #fff;
+            cursor: pointer;
         }
-        .nav-item.focused {
-            border-color: #00FF00; background: #333; outline: none;
-        }
+        .nav-item.focused { border-color: #0f0; background: #333; }
+
         .soft-keys {
-            display: flex; justify-content: space-between; background: #111;
-            padding: 4px 8px; font-size: 12px; font-weight: bold; color: #aaa;
-            border-top: 1px solid #333; flex-shrink: 0;
+            flex-shrink: 0;
+            display: flex; justify-content: space-between;
+            background: #111; padding: 4px 8px;
+            font-size: 12px; font-weight: bold; color: #aaa;
+            border-top: 1px solid #333;
         }
-        
-        /* FULLSCREEN CANVAS STRETCH */
+
+        /* ── Game view: absolute so it truly covers the full 240×320 ── */
         #view-game {
-            width: 240px; height: 320px; margin: 0; padding: 0;
+            position: absolute;
+            top: 0; left: 0;
+            width: 240px; height: 320px;
+            z-index: 50;
             background: #000;
+            overflow: hidden;
         }
+
+        /* CSS dimensions stretch canvas rendering to fill the view.
+           The canvas WIDTH/HEIGHT *attributes* control internal res (set by emulator).
+           The CSS width/height here scale the *output* to 240×320. */
         #game-container {
+            display: block;
+            position: absolute;
+            top: 0 !important; left: 0 !important;
             width: 240px !important;
             height: 320px !important;
-            max-width: 240px !important;
-            max-height: 320px !important;
-            object-fit: fill !important; /* Forces stretch ignoring original aspect ratio */
             image-rendering: pixelated;
-            display: block;
+            image-rendering: crisp-edges;
         }
-        
+
         .hidden { display: none !important; }
-        .danger { color: #ff5555; }
+        .danger { color: #f55; }
     </style>
 </head>
 <body>
-    <div id="app">
-        <div class="header" id="app-header">Retro Mosa</div>
-        
-        <div id="view-home" class="content view">
-            <div class="nav-item" id="btn-upload">📥 Upload Personal ROM</div>
-            <input type="file" id="file-input" class="hidden" accept=".nes,.gba,.gb,.gbc,.sfc,.smc,.md,.bin">
-            <div class="nav-item" id="btn-settings">⚙️ Settings (Map Keys)</div>
-            
-            <div id="rom-list"></div>
-        </div>
+<div id="app">
+    <div class="header" id="app-header">Retro Mosa</div>
 
-        <div id="view-settings" class="content view hidden">
-            <div style="font-size: 12px; margin-bottom: 10px; color: #ccc;">
-                Press ENTER on an action, then press the physical key you want to assign to it.
-            </div>
-            <div id="key-list"></div>
-            <div class="nav-item danger" id="btn-clear-db">🗑️ Delete Uploaded Games</div>
-        </div>
-
-        <!-- Game viewport directly houses the canvas -->
-        <div id="view-game" class="view hidden">
-            <canvas id="game-container"></canvas>
-        </div>
-
-        <div class="soft-keys" id="soft-keys">
-            <span id="lsk-label">Select</span>
-            <span id="rsk-label">Menu</span>
-        </div>
+    <div id="view-home" class="content view">
+        <div class="nav-item" id="btn-upload">📥 Upload Personal ROM</div>
+        <input type="file" id="file-input" class="hidden"
+               accept=".nes,.gba,.gb,.gbc,.sfc,.smc,.md,.bin">
+        <div class="nav-item" id="btn-settings">⚙️ Settings (Map Keys)</div>
+        <div id="rom-list"></div>
     </div>
 
-    <script>
-        const PRELOADED_ROMS = [
-            'https://cdn.jsdelivr.net/gh/cldapps/emulator@main/roms/Pokemon%20-%20FireRed%20Version%20(USA,%20Europe)%20(Rev%201).gba',
-            'https://cdn.jsdelivr.net/gh/cldapps/emulator@main/roms/The%20Legend%20of%20Zelda%20-%20New%20Awakening%20(hack).gbc'
-        ];
+    <div id="view-settings" class="content view hidden">
+        <div style="font-size:12px;margin-bottom:10px;color:#ccc">
+            Press ENTER on an action, then press the key to assign.
+        </div>
+        <div id="key-list"></div>
+        <div class="nav-item danger" id="btn-clear-db">🗑️ Delete Uploaded Games</div>
+    </div>
 
-        // Standard PC Keys expected natively by Emscripten/RetroArch
-        const RA_KEYS = {
-            a: 'z', b: 'x', x: 's', y: 'a',
-            start: 'Enter', select: 'Shift',
-            up: 'ArrowUp', down: 'ArrowDown', left: 'ArrowLeft', right: 'ArrowRight'
-        };
+    <!-- Game overlay — always in DOM, toggled with .hidden -->
+    <div id="view-game" class="view hidden">
+        <canvas id="game-container"></canvas>
+    </div>
 
-        let currentView = 'home';
-        let focusIndex = 0;
-        let isMapping = false;
-        let mappingKeyTarget = null;
-        let emulatorInstance = null;
-        let userRoms = []; 
+    <div class="soft-keys" id="soft-keys">
+        <span id="lsk-label">Select</span>
+        <span id="rsk-label">Menu</span>
+    </div>
+</div>
 
-        let keyMap = JSON.parse(localStorage.getItem('mosa_keymap')) || {
-            a: '3', b: '1', x: '9', y: '7',
-            start: '#', select: '*',
-            up: 'ArrowUp', down: 'ArrowDown', left: 'ArrowLeft', right: 'ArrowRight',
-            quit: 'SoftRight' 
-        };
+<script>
+// ═══════════════════════════════════════════════════════════════
+// CONFIG
+// ═══════════════════════════════════════════════════════════════
+const PRELOADED_ROMS = [
+    'https://cdn.jsdelivr.net/gh/cldapps/emulator@main/roms/Pokemon%20-%20FireRed%20Version%20(USA,%20Europe)%20(Rev%201).gba',
+    'https://cdn.jsdelivr.net/gh/cldapps/emulator@main/roms/The%20Legend%20of%20Zelda%20-%20New%20Awakening%20(hack).gbc'
+];
 
-        const views = {
-            home: document.getElementById('view-home'),
-            settings: document.getElementById('view-settings'),
-            game: document.getElementById('view-game')
-        };
-        const lskLabel = document.getElementById('lsk-label');
-        const rskLabel = document.getElementById('rsk-label');
-        const appHeader = document.getElementById('app-header');
-        const softKeys = document.getElementById('soft-keys');
+// Standard PC keys expected by Emscripten / RetroArch
+const RA_KEYS = {
+    a: 'z', b: 'x', x: 's', y: 'a',
+    start: 'Enter', select: 'Shift',
+    up: 'ArrowUp', down: 'ArrowDown',
+    left: 'ArrowLeft', right: 'ArrowRight'
+};
 
-        async function init() {
-            await loadRomsFromDB();
-            renderRomList();
-            renderSettingsList();
-            updateFocus();
+// Correct keyCode values — special keys were previously returning 0
+const KEY_CODES = {
+    z: 90, x: 88, a: 65, s: 83,
+    Enter: 13, Shift: 16,
+    ArrowUp: 38, ArrowDown: 40,
+    ArrowLeft: 37, ArrowRight: 39,
+    Escape: 27, Tab: 9, Backspace: 8
+};
+
+function getKeyCode(k) {
+    if (k in KEY_CODES) return KEY_CODES[k];
+    if (k.length === 1) return k.toUpperCase().charCodeAt(0);
+    return 0;
+}
+
+function getCodeStr(k) {
+    if (k === 'Enter')         return 'Enter';
+    if (k === 'Shift')         return 'ShiftLeft';
+    if (k.startsWith('Arrow')) return k;
+    if (k.length === 1)        return 'Key' + k.toUpperCase();
+    return k;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// STATE
+// ═══════════════════════════════════════════════════════════════
+let currentView      = 'home';
+let focusIndex       = 0;
+let isMapping        = false;
+let mappingTarget    = null;
+let emulatorInstance = null;
+let userRoms         = [];
+let _sizeInterval    = null;
+let _mutObs          = null;
+let _resObs          = null;
+
+let keyMap = (() => {
+    try { return JSON.parse(localStorage.getItem('mosa_keymap')); } catch (_) { return null; }
+})() || {
+    a: '3', b: '1', x: '9', y: '7',
+    start: '#', select: '*',
+    up: 'ArrowUp', down: 'ArrowDown',
+    left: 'ArrowLeft', right: 'ArrowRight',
+    quit: 'SoftRight'
+};
+
+// ═══════════════════════════════════════════════════════════════
+// DOM REFS
+// ═══════════════════════════════════════════════════════════════
+const views = {
+    home:     document.getElementById('view-home'),
+    settings: document.getElementById('view-settings'),
+    game:     document.getElementById('view-game')
+};
+const lskLabel  = document.getElementById('lsk-label');
+const rskLabel  = document.getElementById('rsk-label');
+const appHeader = document.getElementById('app-header');
+const softKeys  = document.getElementById('soft-keys');
+
+// ═══════════════════════════════════════════════════════════════
+// INIT
+// ═══════════════════════════════════════════════════════════════
+async function init() {
+    await loadRomsFromDB();
+    renderRomList();
+    renderSettingsList();
+    updateFocus();
+}
+
+async function loadRomsFromDB() {
+    userRoms = [];
+    await localforage.iterate((value, key) => {
+        if (key.startsWith('rom_')) userRoms.push(value);
+    });
+}
+
+function getCore(filename) {
+    const ext = filename.split('.').pop().toLowerCase();
+    return { nes:'fceumm', gba:'mgba', gb:'gambatte', gbc:'gambatte',
+             sfc:'snes9x', smc:'snes9x', md:'genesis_plus_gx', bin:'genesis_plus_gx'
+    }[ext] || 'fceumm';
+}
+
+// ═══════════════════════════════════════════════════════════════
+// CANVAS SIZE ENFORCER
+// Nostalgist may overwrite canvas style after launch — we fight back
+// ═══════════════════════════════════════════════════════════════
+function enforceGameSize() {
+    const c = document.getElementById('game-container');
+    if (!c) return;
+    c.style.setProperty('width',    '240px',    'important');
+    c.style.setProperty('height',   '320px',    'important');
+    c.style.setProperty('position', 'absolute', 'important');
+    c.style.setProperty('top',      '0',        'important');
+    c.style.setProperty('left',     '0',        'important');
+    c.style.setProperty('display',  'block',    'important');
+}
+
+function startSizeEnforcer() {
+    const c = document.getElementById('game-container');
+    enforceGameSize();
+
+    // Watch for emulator-driven style / attribute mutations
+    _mutObs = new MutationObserver(enforceGameSize);
+    _mutObs.observe(c, { attributes: true,
+                         attributeFilter: ['style', 'class', 'width', 'height'] });
+
+    if (window.ResizeObserver) {
+        _resObs = new ResizeObserver(enforceGameSize);
+        _resObs.observe(c);
+    }
+
+    // Belt-and-suspenders fallback
+    _sizeInterval = setInterval(enforceGameSize, 300);
+}
+
+function stopSizeEnforcer() {
+    _mutObs && (_mutObs.disconnect(), _mutObs = null);
+    _resObs && (_resObs.disconnect(), _resObs = null);
+    _sizeInterval && (clearInterval(_sizeInterval), _sizeInterval = null);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// VIEW SWITCHING
+// ═══════════════════════════════════════════════════════════════
+function switchView(name) {
+    Object.entries(views).forEach(([k, el]) =>
+        el.classList.toggle('hidden', k !== name)
+    );
+    currentView = name;
+    focusIndex  = 0;
+
+    if (name === 'home') {
+        appHeader.style.display = '';
+        softKeys.style.display  = '';
+        appHeader.innerText     = 'Retro Mosa';
+        lskLabel.innerText      = 'Select';
+        rskLabel.innerText      = 'Menu';
+        stopSizeEnforcer();
+        renderRomList();
+    } else if (name === 'settings') {
+        appHeader.style.display = '';
+        softKeys.style.display  = '';
+        appHeader.innerText     = 'Key Mapper';
+        lskLabel.innerText      = 'Map';
+        rskLabel.innerText      = 'Back';
+    } else if (name === 'game') {
+        appHeader.style.display = 'none';
+        softKeys.style.display  = 'none';
+    }
+    updateFocus();
+}
+
+// ═══════════════════════════════════════════════════════════════
+// FOCUS / NAVIGATION
+// ═══════════════════════════════════════════════════════════════
+function getNavItems() { return views[currentView].querySelectorAll('.nav-item'); }
+
+function updateFocus() {
+    const items = getNavItems();
+    items.forEach((el, i) => {
+        el.classList.toggle('focused', i === focusIndex);
+        if (i === focusIndex) el.scrollIntoView({ block: 'nearest' });
+    });
+}
+
+// ═══════════════════════════════════════════════════════════════
+// KEYMAP INPUT PROXY
+// Physical key → RetroArch standard key → dispatched to document
+// (Emscripten registers its listeners on document / window, NOT the canvas)
+// ═══════════════════════════════════════════════════════════════
+function dispatchRAKey(raKey, isDown) {
+    const kc = getKeyCode(raKey);
+    const ev = new KeyboardEvent(isDown ? 'keydown' : 'keyup', {
+        key:        raKey,
+        code:       getCodeStr(raKey),
+        keyCode:    kc,
+        which:      kc,
+        charCode:   0,
+        bubbles:    true,
+        cancelable: true,
+        view:       window
+    });
+    // Flag so our own capture listener ignores it
+    Object.defineProperty(ev, '_isProxied', { value: true, enumerable: false });
+    document.dispatchEvent(ev);
+}
+
+function handleEmulatorInput(e, isDown) {
+    if (currentView !== 'game') return;
+    if (e._isProxied) return; // don't re-process our own synthetic events
+
+    // Quit to menu
+    if (isDown && (e.key === keyMap.quit || e.key === 'Backspace' || e.key === 'SoftRight')) {
+        e.preventDefault();
+        stopSizeEnforcer();
+        if (emulatorInstance) emulatorInstance.exit().catch(() => {});
+        window.location.reload();
+        return;
+    }
+
+    // Translate bound physical key → RA standard key
+    for (const [action, boundKey] of Object.entries(keyMap)) {
+        if (e.key === boundKey && RA_KEYS[action]) {
+            e.preventDefault();
+            e.stopImmediatePropagation(); // block original from reaching Emscripten
+            dispatchRAKey(RA_KEYS[action], isDown);
+            return;
         }
+    }
+}
 
-        async function loadRomsFromDB() {
-            userRoms = [];
-            await localforage.iterate((value, key) => {
-                if (key.startsWith('rom_')) userRoms.push(value);
-            });
-        }
+// Capture phase so we intercept before Emscripten sees the original event
+window.addEventListener('keydown', (e) => {
+    if (isMapping && currentView === 'settings') {
+        e.preventDefault();
+        keyMap[mappingTarget] = e.key;
+        localStorage.setItem('mosa_keymap', JSON.stringify(keyMap));
+        isMapping = false;
+        renderSettingsList();
+        return;
+    }
 
-        function getEmulatorCore(filename) {
-            const ext = filename.split('.').pop().toLowerCase();
-            const cores = {
-                'nes': 'fceumm', 'gba': 'mgba', 'gb': 'gambatte', 'gbc': 'gambatte',
-                'sfc': 'snes9x', 'smc': 'snes9x', 'md': 'genesis_plus_gx', 'bin': 'genesis_plus_gx'
-            };
-            return cores[ext] || 'fceumm';
-        }
+    if (currentView === 'game') { handleEmulatorInput(e, true); return; }
 
-        function switchView(viewName) {
-            Object.values(views).forEach(v => v.classList.add('hidden'));
-            views[viewName].classList.remove('hidden');
-            views[viewName].style.display = 'block';
-            
-            currentView = viewName;
-            focusIndex = 0;
+    const items = getNavItems();
+    switch (e.key) {
+        case 'ArrowDown':
+            e.preventDefault();
+            focusIndex = (focusIndex + 1) % items.length;
+            updateFocus(); break;
+        case 'ArrowUp':
+            e.preventDefault();
+            focusIndex = (focusIndex - 1 + items.length) % items.length;
+            updateFocus(); break;
+        case 'Enter': case 'SoftLeft':
+            e.preventDefault();
+            if (items[focusIndex]) items[focusIndex].click(); break;
+        case 'SoftRight': case 'Backspace':
+            e.preventDefault();
+            if (currentView === 'settings') switchView('home'); break;
+    }
+}, true);
 
-            if (viewName === 'home') {
-                appHeader.style.display = 'block';
-                softKeys.style.display = 'flex';
-                appHeader.innerText = "Retro Mosa";
-                lskLabel.innerText = "Select";
-                rskLabel.innerText = "Menu";
-                renderRomList();
-            } else if (viewName === 'settings') {
-                appHeader.style.display = 'block';
-                softKeys.style.display = 'flex';
-                appHeader.innerText = "Key Mapper";
-                lskLabel.innerText = "Map";
-                rskLabel.innerText = "Back";
-            } else if (viewName === 'game') {
-                // Completely hide header and soft-keys for full 240x320 stretch
-                appHeader.style.display = 'none';
-                softKeys.style.display = 'none';
-            }
-            updateFocus();
-        }
+window.addEventListener('keyup', (e) => {
+    if (currentView === 'game') handleEmulatorInput(e, false);
+}, true);
 
-        function getNavItems() {
-            return views[currentView].querySelectorAll('.nav-item');
-        }
+// ═══════════════════════════════════════════════════════════════
+// RENDERING HELPERS
+// ═══════════════════════════════════════════════════════════════
+function navItem(label, onClick) {
+    const el = document.createElement('div');
+    el.className = 'nav-item';
+    el.innerText = label;
+    el.onclick = onClick;
+    return el;
+}
+function sectionTitle(text) {
+    const el = document.createElement('div');
+    el.className = 'section-title';
+    el.innerText = text;
+    return el;
+}
 
-        function updateFocus() {
-            const items = getNavItems();
-            items.forEach((el, i) => {
-                if (i === focusIndex) {
-                    el.classList.add('focused');
-                    el.scrollIntoView({ block: 'nearest' });
-                } else {
-                    el.classList.remove('focused');
-                }
-            });
-        }
+function renderRomList() {
+    const list = document.getElementById('rom-list');
+    list.innerHTML = '';
 
-        // --- KEYMAP PROXY HANDLER ---
-        // Catches physical cloud-phone keys and translates them to standard PC keyboard
-        // events so Emscripten/RetroArch natively detects them.
-        function handleEmulatorInput(e, isDown) {
-            if (currentView !== 'game' || e.isProxied) return;
+    if (PRELOADED_ROMS.length) {
+        list.appendChild(sectionTitle('Built-in Games'));
+        PRELOADED_ROMS.forEach(url => {
+            const name = decodeURIComponent(url.split('/').pop());
+            list.appendChild(navItem(`☁️ ${name}`, () => launchGame(url, true)));
+        });
+    }
 
-            // Handle quitting the emulator safely
-            if (isDown && (e.key === keyMap.quit || e.key === 'Backspace' || e.key === 'SoftRight')) {
-                e.preventDefault();
-                if (emulatorInstance) {
-                    emulatorInstance.exit().catch(()=>{});
-                    window.location.reload(); 
-                }
-                return;
-            }
-
-            for (const [action, boundKey] of Object.entries(keyMap)) {
-                if (e.key === boundKey && RA_KEYS[action]) {
-                    e.preventDefault();
-                    e.stopImmediatePropagation(); // Block original physical key
-                    
-                    const stdKey = RA_KEYS[action];
-                    const fakeEvent = new KeyboardEvent(isDown ? 'keydown' : 'keyup', {
-                        key: stdKey,
-                        code: stdKey.length > 1 ? stdKey : 'Key' + stdKey.toUpperCase(),
-                        keyCode: stdKey.length === 1 ? stdKey.toUpperCase().charCodeAt(0) : 0,
-                        bubbles: true, cancelable: true
-                    });
-                    fakeEvent.isProxied = true;
-                    
-                    const canvas = document.getElementById('game-container');
-                    if (canvas) canvas.dispatchEvent(fakeEvent);
-                    return;
-                }
-            }
-        }
-
-        window.addEventListener('keydown', (e) => {
-            // Mapping Logic
-            if (isMapping && currentView === 'settings') {
-                e.preventDefault();
-                keyMap[mappingKeyTarget] = e.key;
-                localStorage.setItem('mosa_keymap', JSON.stringify(keyMap));
-                isMapping = false;
-                renderSettingsList();
-                return;
-            }
-
-            // Gameplay input
-            if (currentView === 'game') {
-                handleEmulatorInput(e, true);
-                return;
-            }
-
-            // UI Navigation
-            const items = getNavItems();
-            if (e.key === 'ArrowDown') {
-                e.preventDefault();
-                focusIndex = (focusIndex + 1) % items.length;
-                updateFocus();
-            } else if (e.key === 'ArrowUp') {
-                e.preventDefault();
-                focusIndex = (focusIndex - 1 + items.length) % items.length;
-                updateFocus();
-            } else if (e.key === 'Enter' || e.key === 'SoftLeft') {
-                e.preventDefault();
-                if (items[focusIndex]) items[focusIndex].click();
-            } else if (e.key === 'SoftRight' || e.key === 'Backspace') {
-                e.preventDefault();
-                if (currentView === 'settings') switchView('home');
-            }
-        }, true); // Use capture phase to intercept before Emscripten
-
-        window.addEventListener('keyup', (e) => {
-            if (currentView === 'game') handleEmulatorInput(e, false);
-        }, true);
-
-        // --- UI RENDERING ---
-        function renderRomList() {
-            const list = document.getElementById('rom-list');
-            list.innerHTML = '';
-
-            if (PRELOADED_ROMS.length > 0) {
-                const titlePre = document.createElement('div');
-                titlePre.className = 'section-title';
-                titlePre.innerText = 'Built-in Games';
-                list.appendChild(titlePre);
-
-                PRELOADED_ROMS.forEach(romPath => {
-                    const rawFileName = romPath.split('/').pop();
-                    const cleanFileName = decodeURIComponent(rawFileName);
-                    
-                    const div = document.createElement('div');
-                    div.className = 'nav-item';
-                    div.innerHTML = `☁️ ${cleanFileName}`;
-                    div.onclick = () => launchGame(romPath, true);
-                    list.appendChild(div);
-                });
-            }
-
-            if (userRoms.length > 0) {
-                const titleUser = document.createElement('div');
-                titleUser.className = 'section-title';
-                titleUser.innerText = 'My Uploads';
-                list.appendChild(titleUser);
-
-                userRoms.forEach(rom => {
-                    const div = document.createElement('div');
-                    div.className = 'nav-item';
-                    div.innerHTML = `💾 ${rom.name}`;
-                    div.onclick = () => launchGame(rom.id, false); 
-                    list.appendChild(div);
-                    
-                    const delDiv = document.createElement('div');
-                    delDiv.className = 'nav-item danger';
-                    delDiv.innerHTML = `❌ Delete ${rom.name.substring(0,10)}...`;
-                    delDiv.onclick = async () => {
-                        await localforage.removeItem('rom_' + rom.id);
-                        await loadRomsFromDB();
-                        renderRomList();
-                        updateFocus();
-                    };
-                    list.appendChild(delDiv);
-                });
-            }
-            updateFocus();
-        }
-
-        function renderSettingsList() {
-            const list = document.getElementById('key-list');
-            list.innerHTML = '';
-            const mapOrder = ['a', 'b', 'x', 'y', 'start', 'select', 'up', 'down', 'left', 'right', 'quit'];
-            
-            mapOrder.forEach(key => {
-                const div = document.createElement('div');
-                div.className = 'nav-item';
-                div.innerHTML = isMapping && mappingKeyTarget === key 
-                    ? `Mapping [${key.toUpperCase()}]... Press a key!`
-                    : `Map ${key.toUpperCase()} (Current: <b>${keyMap[key]}</b>)`;
-                
-                div.onclick = () => {
-                    isMapping = true;
-                    mappingKeyTarget = key;
-                    renderSettingsList();
-                };
-                list.appendChild(div);
-            });
-            updateFocus();
-        }
-
-        document.getElementById('btn-upload').onclick = () => { document.getElementById('file-input').click(); };
-        document.getElementById('btn-settings').onclick = () => { switchView('settings'); };
-        document.getElementById('btn-clear-db').onclick = async () => {
-            await localforage.clear();
-            userRoms = [];
-            switchView('home');
-        };
-
-        document.getElementById('file-input').addEventListener('change', async (e) => {
-            const file = e.target.files[0];
-            if (!file) return;
-            
-            appHeader.innerText = "Saving ROM...";
-            try {
-                const buffer = await file.arrayBuffer();
-                const blob = new Blob([buffer]);
-                const romId = Date.now();
-                
-                await localforage.setItem('rom_' + romId, { id: romId, name: file.name, blob: blob });
+    if (userRoms.length) {
+        list.appendChild(sectionTitle('My Uploads'));
+        userRoms.forEach(rom => {
+            list.appendChild(navItem(`💾 ${rom.name}`, () => launchGame(rom.id, false)));
+            const del = navItem(`❌ Delete ${rom.name.substring(0, 10)}…`, async () => {
+                await localforage.removeItem('rom_' + rom.id);
                 await loadRomsFromDB();
                 renderRomList();
-                appHeader.innerText = "Retro Mosa";
-            } catch (err) {
-                alert("Storage error: " + err.message);
-                appHeader.innerText = "Retro Mosa";
-            }
+                updateFocus();
+            });
+            del.classList.add('danger');
+            list.appendChild(del);
         });
+    }
+    updateFocus();
+}
 
-        // --- LAUNCH GAME ---
-        async function launchGame(identifier, isPreloaded) {
-            switchView('game');
+function renderSettingsList() {
+    const list = document.getElementById('key-list');
+    list.innerHTML = '';
+    ['a','b','x','y','start','select','up','down','left','right','quit'].forEach(key => {
+        const el = document.createElement('div');
+        el.className = 'nav-item';
+        el.innerHTML = (isMapping && mappingTarget === key)
+            ? `Mapping [${key.toUpperCase()}]… press a key!`
+            : `Map ${key.toUpperCase()} &nbsp;<b>(${keyMap[key]})</b>`;
+        el.onclick = () => { isMapping = true; mappingTarget = key; renderSettingsList(); };
+        list.appendChild(el);
+    });
+    updateFocus();
+}
 
-            try {
-                let romSource;
-                let fileName;
+// ═══════════════════════════════════════════════════════════════
+// BUTTON WIRING
+// ═══════════════════════════════════════════════════════════════
+document.getElementById('btn-upload').onclick = () =>
+    document.getElementById('file-input').click();
 
-                if (isPreloaded) {
-                    romSource = identifier;
-                    fileName = decodeURIComponent(identifier.split('/').pop());
-                } else {
-                    const romData = await localforage.getItem('rom_' + identifier);
-                    if (!romData) throw new Error("ROM not found in DB.");
-                    const fileData = romData.blob || romData.buffer; 
-                    romSource = new File([fileData], romData.name);
-                    fileName = romData.name;
-                }
+document.getElementById('btn-settings').onclick = () => switchView('settings');
 
-                const coreName = getEmulatorCore(fileName);
+document.getElementById('btn-clear-db').onclick = async () => {
+    await localforage.clear();
+    userRoms = [];
+    switchView('home');
+};
 
-                // Note: We no longer pass custom keys into retroarchConfig. 
-                // The Proxy Handler maps your keys directly into standard inputs!
-                emulatorInstance = await Nostalgist.launch({
-                    core: coreName,
-                    rom: romSource, 
-                    element: document.getElementById('game-container')
-                });
-            } catch (err) {
-                alert("Failed to load! " + err.message);
-                switchView('home');
-            }
+document.getElementById('file-input').addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    appHeader.innerText = 'Saving…';
+    try {
+        const blob = new Blob([await file.arrayBuffer()]);
+        const id = Date.now();
+        await localforage.setItem('rom_' + id, { id, name: file.name, blob });
+        await loadRomsFromDB();
+        renderRomList();
+    } catch (err) {
+        alert('Storage error: ' + err.message);
+    }
+    appHeader.innerText = 'Retro Mosa';
+});
+
+// ═══════════════════════════════════════════════════════════════
+// LAUNCH GAME
+// ═══════════════════════════════════════════════════════════════
+async function launchGame(identifier, isPreloaded) {
+    switchView('game');
+    try {
+        let romSource, fileName;
+
+        if (isPreloaded) {
+            romSource = identifier;
+            fileName  = decodeURIComponent(identifier.split('/').pop());
+        } else {
+            const romData = await localforage.getItem('rom_' + identifier);
+            if (!romData) throw new Error('ROM not found in database.');
+            romSource = new File([romData.blob || romData.buffer], romData.name);
+            fileName  = romData.name;
         }
 
-        init();
-    </script>
+        emulatorInstance = await Nostalgist.launch({
+            core:    getCore(fileName),
+            rom:     romSource,
+            element: document.getElementById('game-container')
+        });
+
+        // Start enforcing size AFTER emulator has finished its own setup
+        startSizeEnforcer();
+
+    } catch (err) {
+        alert('Failed to load: ' + err.message);
+        switchView('home');
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// GO
+// ═══════════════════════════════════════════════════════════════
+init();
+</script>
 </body>
 </html>
